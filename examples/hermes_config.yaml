@@ -1,0 +1,10 @@
+modules:
+  grok_search:
+    enabled: true
+    package: hermes_mcps_grok_search
+    config:
+      base_url: https://example.sohri.net/v1
+      api_key_env: GROK_SEARCH_API_KEY
+      model: grok-4.5-low
+      timeout: 90
+      search_context_size: medium
