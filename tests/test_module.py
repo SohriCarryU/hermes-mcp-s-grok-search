@@ -193,17 +193,43 @@ def test_parser_extracts_bare_url_fallback():
     assert parsed["trace_status"] == "text_citation_fallback"
 
 
+@pytest.mark.parametrize(
+    ("raw_url", "clean_url"),
+    [
+        ("https://pnpm.io/installation|num_results|3", "https://pnpm.io/installation"),
+        (
+            "https://github.com/pnpm/pnpm/releases|num_results|3",
+            "https://github.com/pnpm/pnpm/releases",
+        ),
+    ],
+)
+def test_parser_cleans_pipe_suffix_from_bare_url_fallback(raw_url, clean_url):
+    parsed = parse_response({"output_text": f"9|web_search|q|{raw_url}"})
+
+    assert parsed["citations"] == [{"url": clean_url, "title": "pnpm.io" if "pnpm.io" in clean_url else "github.com"}]
+    assert parsed["trace_status"] == "text_citation_fallback"
+
+
+def test_parser_preserves_bare_url_query_string():
+    parsed = parse_response({"output_text": "Source: https://example.com/search?q=pnpm&lang=zh"})
+
+    assert parsed["citations"] == [
+        {"url": "https://example.com/search?q=pnpm&lang=zh", "title": "example.com"}
+    ]
+    assert parsed["trace_status"] == "text_citation_fallback"
+
+
 def test_parser_deduplicates_text_citation_urls():
     parsed = parse_response(
         {
             "output_text": (
-                "Sources: [[1]](https://example.com/same), "
-                "[duplicate](https://example.com/same), and https://example.com/same."
+                "Sources: https://example.com/same|num_results|3, "
+                "https://example.com/same|num_results|3, and https://example.com/same."
             )
         }
     )
 
-    assert parsed["citations"] == [{"url": "https://example.com/same", "title": "1"}]
+    assert parsed["citations"] == [{"url": "https://example.com/same", "title": "example.com"}]
     assert parsed["trace_status"] == "text_citation_fallback"
 
 

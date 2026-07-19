@@ -160,7 +160,8 @@ def _append_text_citation(
 
 
 def _clean_url(url: str) -> str:
-    return url.rstrip(".,;:!?)]}'\"")
+    url_without_pipe_suffix = url.split("|", 1)[0]
+    return url_without_pipe_suffix.rstrip(".,;:!?)]}'\"")
 
 
 def _has_structured_search_trace(value: Any) -> bool:
