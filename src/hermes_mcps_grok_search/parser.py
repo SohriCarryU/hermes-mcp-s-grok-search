@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 
-SEARCH_TRACE_KEYS = {"web_search_call", "search", "citations", "annotations", "url", "source"}
+DOUBLE_BRACKET_LINK_PATTERN = re.compile(r"\[\[([^\]\r\n]+)\]\]\((https?://[^\s<>)]+)\)", re.IGNORECASE)
+MARKDOWN_LINK_PATTERN = re.compile(r"(?<!\[)\[([^\]\r\n]+)\]\((https?://[^\s<>)]+)\)", re.IGNORECASE)
+BARE_URL_PATTERN = re.compile(r"https?://[^\s<>\]]+", re.IGNORECASE)
 
 
 def parse_response(payload: dict[str, Any]) -> dict[str, Any]:
     answer = _extract_answer(payload)
-    citations: list[dict[str, Any]] = []
-    _collect_citations(payload, citations)
-    has_search_trace = _has_search_trace(payload) or bool(citations)
+    structured_citations: list[dict[str, Any]] = []
+    _collect_citations(payload, structured_citations)
+    structured_citations = _dedupe_citations(structured_citations)
+    has_structured_trace = _has_structured_search_trace(payload) or bool(structured_citations)
+
+    if has_structured_trace:
+        citations = structured_citations
+        trace_status = "structured"
+    else:
+        citations = _extract_text_citations(answer)
+        trace_status = "text_citation_fallback" if citations else "missing"
+
     raw_summary = {
         "id": payload.get("id"),
         "object": payload.get("object"),
@@ -19,8 +32,9 @@ def parse_response(payload: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "answer": answer,
-        "citations": _dedupe_citations(citations),
-        "has_search_trace": has_search_trace,
+        "citations": citations,
+        "has_search_trace": has_structured_trace,
+        "trace_status": trace_status,
         "raw_summary": {key: value for key, value in raw_summary.items() if value is not None},
     }
 
@@ -37,7 +51,7 @@ def _extract_answer(payload: dict[str, Any]) -> str:
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
-            if item_type not in {None, "message"} and "content" not in item:
+            if item_type not in {None, "message"}:
                 continue
             content = item.get("content")
             if isinstance(content, list):
@@ -94,29 +108,91 @@ def _citation_from_mapping(value: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dedupe_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[tuple[Any, Any, Any]] = set()
+    seen_urls: set[str] = set()
+    seen_other: set[tuple[Any, Any, Any]] = set()
     result: list[dict[str, Any]] = []
     for citation in citations:
-        marker = (citation.get("url"), citation.get("title"), citation.get("source"))
-        if marker in seen:
-            continue
-        seen.add(marker)
+        url = citation.get("url")
+        if isinstance(url, str) and url:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+        else:
+            marker = (url, citation.get("title"), citation.get("source"))
+            if marker in seen_other:
+                continue
+            seen_other.add(marker)
         result.append(citation)
     return result
 
 
-def _has_search_trace(value: Any) -> bool:
+def _extract_text_citations(answer: str) -> list[dict[str, Any]]:
+    citations: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+
+    for pattern in (DOUBLE_BRACKET_LINK_PATTERN, MARKDOWN_LINK_PATTERN):
+        for match in pattern.finditer(answer):
+            title = match.group(1).strip()
+            _append_text_citation(citations, seen_urls, match.group(2), title)
+
+    for match in BARE_URL_PATTERN.finditer(answer):
+        url = _clean_url(match.group(0))
+        host = urlsplit(url).hostname or ""
+        _append_text_citation(citations, seen_urls, url, host)
+
+    return citations
+
+
+def _append_text_citation(
+    citations: list[dict[str, Any]],
+    seen_urls: set[str],
+    url: str,
+    title: str,
+) -> None:
+    cleaned_url = _clean_url(url)
+    if not cleaned_url or cleaned_url in seen_urls:
+        return
+    seen_urls.add(cleaned_url)
+    citation = {"url": cleaned_url}
+    if title:
+        citation["title"] = title
+    citations.append(citation)
+
+
+def _clean_url(url: str) -> str:
+    return url.rstrip(".,;:!?)]}'\"")
+
+
+def _has_structured_search_trace(value: Any) -> bool:
     if isinstance(value, dict):
+        item_type = value.get("type")
+        if isinstance(item_type, str) and item_type.lower() in {"web_search_call", "search"}:
+            return True
         for key, child in value.items():
-            if str(key).lower() in SEARCH_TRACE_KEYS:
+            lowered_key = str(key).lower()
+            if lowered_key in {"web_search_call", "search"} and _is_non_empty(child):
                 return True
-            if isinstance(child, str) and str(key).lower() == "type" and child in SEARCH_TRACE_KEYS:
+            if lowered_key in {"annotations", "citations", "sources"} and _is_non_empty(child):
                 return True
-            if _has_search_trace(child):
+            if lowered_key in {"url", "uri"} and _is_http_url(child):
+                return True
+            if lowered_key == "source" and _is_non_empty(child):
+                return True
+            if isinstance(child, (dict, list)) and _has_structured_search_trace(child):
                 return True
     elif isinstance(value, list):
-        return any(_has_search_trace(item) for item in value)
+        return any(_has_structured_search_trace(item) for item in value)
     return False
+
+
+def _is_non_empty(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return bool(value)
+
+
+def _is_http_url(value: Any) -> bool:
+    return isinstance(value, str) and value.lower().startswith(("http://", "https://"))
 
 
 def _string_or_none(value: Any) -> str | None:

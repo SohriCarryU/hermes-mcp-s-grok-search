@@ -76,6 +76,7 @@ class GrokSearchClient:
                 "citations": parsed["citations"],
                 "model": self.config.model,
                 "duration_ms": duration_ms,
+                "trace_status": parsed["trace_status"],
                 "error": "Grok Responses returned no answer text.",
             }
 
@@ -86,8 +87,14 @@ class GrokSearchClient:
             "citations": parsed["citations"],
             "model": self.config.model,
             "duration_ms": duration_ms,
+            "trace_status": parsed["trace_status"],
         }
-        if not parsed["has_search_trace"]:
+        if parsed["trace_status"] == "text_citation_fallback":
+            result["warning"] = (
+                "No structured web_search trace was detected; "
+                "extracted citation URLs from assistant text fallback."
+            )
+        elif parsed["trace_status"] == "missing":
             result["warning"] = "Response contained answer text but no detectable web_search trace. Treat it as unverified."
         if include_raw:
             result["raw"] = payload

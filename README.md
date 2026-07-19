@@ -30,6 +30,8 @@ with a Responses-style request body containing:
 
 It does not use `/v1/chat/completions` or a chat `messages` payload as the search path. If a response contains answer text but no detectable `web_search_call`, `search`, `citations`, `annotations`, `url`, or `source` trace, the tool returns `ok: true` with a warning instead of pretending that a verified web search occurred.
 
+Some CPA/Grok Responses payloads omit structured `web_search_call` and annotations while returning source links in assistant text. In that case, the module extracts Markdown or bare HTTP(S) URLs into `citations` and reports `trace_status: text_citation_fallback`. This is weaker evidence than a structured search trace and is always surfaced with a warning. Responses with structured evidence report `trace_status: structured`; responses with neither structured evidence nor citation URLs report `trace_status: missing`.
+
 ## Configuration
 
 Example `hermes-mcp-s` module config:
@@ -93,6 +95,7 @@ Success shape:
   "citations": [],
   "model": "grok-4.5-low",
   "duration_ms": 123,
+  "trace_status": "structured",
   "warning": "optional warning",
   "raw": "only when include_raw=true"
 }

@@ -118,6 +118,7 @@ def test_parser_parses_output_text():
 
     assert parsed["answer"] == "Plain answer"
     assert parsed["has_search_trace"] is True
+    assert parsed["trace_status"] == "structured"
 
 
 def test_parser_parses_output_content_text():
@@ -150,6 +151,105 @@ def test_parser_extracts_annotations_citations_and_urls():
         {"title": "Source title", "url": "https://source.example/item", "snippet": "Useful snippet"}
     ]
     assert parsed["has_search_trace"] is True
+    assert parsed["trace_status"] == "structured"
+
+
+def test_parser_uses_text_citation_fallback_for_cpa_grok_response():
+    payload = {
+        "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Internal reasoning"}]},
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "annotations": [],
+                        "text": "Current result [[1]](https://example.com/source).",
+                    }
+                ],
+            },
+        ]
+    }
+
+    parsed = parse_response(payload)
+
+    assert parsed["answer"] == "Current result [[1]](https://example.com/source)."
+    assert parsed["citations"] == [{"url": "https://example.com/source", "title": "1"}]
+    assert parsed["has_search_trace"] is False
+    assert parsed["trace_status"] == "text_citation_fallback"
+
+
+def test_parser_extracts_standard_markdown_link_fallback():
+    parsed = parse_response({"output_text": "Read [Example source](https://example.com/path) for details."})
+
+    assert parsed["citations"] == [{"url": "https://example.com/path", "title": "Example source"}]
+    assert parsed["trace_status"] == "text_citation_fallback"
+
+
+def test_parser_extracts_bare_url_fallback():
+    parsed = parse_response({"output_text": "Source: https://example.com/path?q=1."})
+
+    assert parsed["citations"] == [{"url": "https://example.com/path?q=1", "title": "example.com"}]
+    assert parsed["trace_status"] == "text_citation_fallback"
+
+
+def test_parser_deduplicates_text_citation_urls():
+    parsed = parse_response(
+        {
+            "output_text": (
+                "Sources: [[1]](https://example.com/same), "
+                "[duplicate](https://example.com/same), and https://example.com/same."
+            )
+        }
+    )
+
+    assert parsed["citations"] == [{"url": "https://example.com/same", "title": "1"}]
+    assert parsed["trace_status"] == "text_citation_fallback"
+
+
+def test_pseudo_web_search_text_without_url_is_missing():
+    parsed = parse_response(
+        {
+            "output_text": (
+                'web_search[{"query":"current result"}]\n'
+                "<web_search><query>current result</query></web_search>"
+            )
+        }
+    )
+
+    assert parsed["citations"] == []
+    assert parsed["has_search_trace"] is False
+    assert parsed["trace_status"] == "missing"
+
+
+def test_text_fallback_does_not_override_structured_evidence():
+    payload = {
+        "output": [
+            {"type": "web_search_call"},
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Answer [text source](https://text.example/source).",
+                        "annotations": [
+                            {
+                                "title": "Structured source",
+                                "url": "https://structured.example/source",
+                            }
+                        ],
+                    }
+                ],
+            },
+        ]
+    }
+
+    parsed = parse_response(payload)
+
+    assert parsed["trace_status"] == "structured"
+    assert parsed["citations"] == [
+        {"title": "Structured source", "url": "https://structured.example/source"}
+    ]
 
 
 def test_no_search_trace_produces_warning(monkeypatch):
@@ -161,7 +261,24 @@ def test_no_search_trace_produces_warning(monkeypatch):
 
     assert result["ok"] is True
     assert "warning" in result
+    assert result["trace_status"] == "missing"
     assert "raw" not in result
+
+
+def test_text_citation_fallback_produces_explicit_warning(monkeypatch):
+    monkeypatch.setenv("GROK_SEARCH_API_KEY", "test-secret-value")
+    fake_http = FakeHttpClient(FakeResponse(payload={"output_text": "Source [[1]](https://example.com/item)"}))
+    handler = make_grok_search_handler(parse_config({"base_url": "https://example.sohri.net/v1"}), http_client=fake_http)
+
+    result = handler({"query": "anything"})
+
+    assert result["ok"] is True
+    assert result["trace_status"] == "text_citation_fallback"
+    assert result["citations"] == [{"url": "https://example.com/item", "title": "1"}]
+    assert result["warning"] == (
+        "No structured web_search trace was detected; "
+        "extracted citation URLs from assistant text fallback."
+    )
 
 
 def test_include_raw_false_omits_raw(monkeypatch):
