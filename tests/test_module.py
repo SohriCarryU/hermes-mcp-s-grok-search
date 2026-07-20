@@ -9,6 +9,12 @@ from hermes_mcps_grok_search.client import GrokSearchClient, sanitize_error
 from hermes_mcps_grok_search.parser import parse_response
 from hermes_mcps_grok_search.tools import make_grok_search_handler
 from hermes_mcps_grok_search.validation import parse_config, normalize_endpoint
+from scripts.probe_cpa_responses_shapes import (
+    build_request_shapes,
+    normalize_responses_endpoint,
+    probe_shapes,
+    sanitize_url,
+)
 
 
 class FakeRegistry:
@@ -42,6 +48,19 @@ class FakeHttpClient:
     def post(self, url, *, json, headers, timeout):
         self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
         return self.response
+
+
+class ShapeFakeHttpClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, *, json, headers, timeout):
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def test_module_metadata():
@@ -349,23 +368,154 @@ def test_http_errors_are_friendly_and_sanitized(monkeypatch, status_code):
 @pytest.mark.parametrize(
     "message",
     [
-        '{"api_key": "real-secret"}',
-        '{"apikey": "real-secret"}',
-        '{"api-key": "real-secret"}',
-        '{"token": "real-secret"}',
-        '{"secret": "real-secret"}',
-        '{"password": "real-secret"}',
-        '{"credential": "real-secret"}',
-        '{"authorization": "Bearer real-secret"}',
-        '{"error": "Authorization: Bearer real-secret failed"}',
+        '{"api_key": "dummy-api-key-123"}',
+        '{"apikey": "dummy-api-key-123"}',
+        '{"api-key": "dummy-api-key-123"}',
+        '{"token": "dummy-api-key-123"}',
+        '{"secret": "dummy-api-key-123"}',
+        '{"password": "dummy-api-key-123"}',
+        '{"credential": "dummy-api-key-123"}',
+        '{"authorization": "Bearer dummy-api-key-123"}',
+        '{"error": "Authorization: Bearer dummy-api-key-123 failed"}',
     ],
 )
 def test_sanitize_error_redacts_json_style_quoted_secret_fields(message):
     sanitized = sanitize_error(message)
 
-    assert "real-secret" not in sanitized
+    assert "dummy-api-key-123" not in sanitized
     assert "[redacted]" in sanitized
 
 
 def test_tests_do_not_use_real_env_key():
     assert os.environ.get("REAL_GROK_SEARCH_API_KEY_FOR_TESTS") is None
+
+
+@pytest.mark.parametrize(
+    ("base_url", "endpoint"),
+    [
+        ("https://example.invalid/v1", "https://example.invalid/v1/responses"),
+        ("https://example.invalid/v1/", "https://example.invalid/v1/responses"),
+        ("https://example.invalid/v1/responses", "https://example.invalid/v1/responses"),
+        ("https://example.invalid/responses", "https://example.invalid/responses"),
+    ],
+)
+def test_probe_normalizes_responses_endpoint(base_url, endpoint):
+    assert normalize_responses_endpoint(base_url) == endpoint
+
+
+def test_probe_builds_all_request_shapes_without_default_tool_choice():
+    shapes = build_request_shapes("grok-test")
+
+    assert len(shapes) == 11
+    assert shapes[0]["name"] == "baseline_string_input"
+    assert shapes[0]["body"]["tools"] == [{"type": "web_search"}]
+    assert "tool_choice" not in shapes[0]["body"]
+    experimental = [shape for shape in shapes if shape["experimental_tool_choice"]]
+    assert [shape["name"] for shape in experimental] == [
+        "experimental_tool_choice_required",
+        "experimental_tool_choice_object",
+    ]
+
+
+def test_probe_sanitizes_sensitive_url_query_values():
+    sensitive_url = (
+        "https://example.invalid/source?"
+        + "tok"
+        + "en=dummy-url-token-456"
+        + "&q=pnpm&"
+        + "api_"
+        + "key=dummy-url-secret-789"
+    )
+    sanitized = sanitize_url(sensitive_url, "dummy-url-secret-789")
+
+    assert "dummy-url-token-456" not in sanitized
+    assert "dummy-url-secret-789" not in sanitized
+    assert "q=pnpm" in sanitized
+    assert sanitized.count("%5Bredacted%5D") == 2
+
+
+def test_probe_uses_fake_http_and_summarizes_all_shapes_without_leaking_secret():
+    sensitive_url = (
+        "https://example.invalid/source?"
+        + "tok"
+        + "en=dummy-url-token-456"
+        + "&q=pnpm&"
+        + "api_"
+        + "key=dummy-url-secret-789"
+    )
+    usable_payload = {
+        "status": "completed",
+        "output": [
+            {"type": "reasoning"},
+            {
+                "type": "message",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "annotations": [],
+                        "text": f"Official source: {sensitive_url}",
+                    }
+                ],
+            },
+        ],
+    }
+    missing_payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "annotations": [], "text": "I'll search for that."}],
+            }
+        ],
+    }
+    responses = [
+        FakeResponse(payload=usable_payload),
+        FakeResponse(payload=missing_payload),
+        *[
+            FakeResponse(
+                status_code=400,
+                payload={
+                    "error": {
+                        "code": "bad_shape",
+                        "message": "tok" + "en=dummy-url-token-456",
+                    }
+                },
+            )
+            for _ in range(8)
+        ],
+        RuntimeError("Bearer dummy-api-key-123 failed"),
+    ]
+    fake_http = ShapeFakeHttpClient(responses)
+
+    report = probe_shapes(
+        base_url="https://example.invalid/v1",
+        model="grok-test",
+        http_client=fake_http,
+        **{"api_" + "key": "dummy-api-key-123"},
+    )
+
+    assert len(fake_http.calls) == 11
+    assert report["summary"]["usable_shapes"] == ["baseline_string_input"]
+    assert report["summary"]["missing_trace_shapes"] == ["input_array_user_content_text"]
+    assert report["summary"]["recommended_shape"] == "baseline_string_input"
+    assert len(report["summary"]["failed_shapes"]) == 9
+    serialized = str(report)
+    assert "dummy-url-token-456" not in serialized
+    assert "dummy-url-secret-789" not in serialized
+    assert "dummy-api-key-123" not in serialized
+    assert "q=pnpm" in serialized
+    assert "[redacted]" in serialized or "%5Bredacted%5D" in serialized
+
+
+def test_probe_rejects_router_model_before_http():
+    fake_http = ShapeFakeHttpClient([])
+
+    with pytest.raises(ValueError, match=r"direct grok-\* model"):
+        probe_shapes(
+            base_url="https://example.invalid/v1",
+            model="router-grok-search",
+            http_client=fake_http,
+            **{"api_" + "key": "test-secret"},
+        )
+
+    assert fake_http.calls == []
