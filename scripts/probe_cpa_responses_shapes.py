@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -23,6 +23,7 @@ from hermes_mcps_grok_search.parser import parse_response
 QUERY = "What is the latest stable pnpm version? Cite official sources."
 BASELINE_INPUT = f"Search the web and answer with official source citations. Query: {QUERY}"
 INSTRUCTIONS = "You must use web search when available. Return concise answer and cite official URLs."
+DEFAULT_TIMEOUT = 30.0
 SENSITIVE_KEY_FRAGMENTS = (
     "api_key",
     "apikey",
@@ -95,23 +96,59 @@ def probe_shapes(
     api_key: str,
     model: str,
     http_client: Any,
-    timeout: float = 90.0,
+    timeout: float = DEFAULT_TIMEOUT,
+    shape_names: list[str] | None = None,
+    skip_experimental_tool_choice: bool = False,
+    event_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if not model.lower().startswith("grok-"):
         raise ValueError("GROK_SEARCH_MODEL must be a direct grok-* model")
 
     endpoint = normalize_responses_endpoint(base_url)
-    results = [
-        probe_shape(
+    shapes = select_request_shapes(
+        build_request_shapes(model),
+        shape_names=shape_names,
+        skip_experimental_tool_choice=skip_experimental_tool_choice,
+    )
+    results = []
+    for shape in shapes:
+        if event_sink is not None:
+            event_sink(
+                {
+                    "event": "start",
+                    "shape": shape["name"],
+                    "experimental_tool_choice": shape["experimental_tool_choice"],
+                }
+            )
+        result = probe_shape(
             shape,
             endpoint=endpoint,
             api_key=api_key,
             http_client=http_client,
             timeout=timeout,
         )
-        for shape in build_request_shapes(model)
-    ]
+        results.append(result)
+        if event_sink is not None:
+            event_sink(result)
     return {"results": results, "summary": summarize_results(results)}
+
+
+def select_request_shapes(
+    shapes: list[dict[str, Any]],
+    *,
+    shape_names: list[str] | None = None,
+    skip_experimental_tool_choice: bool = False,
+) -> list[dict[str, Any]]:
+    requested = set(shape_names or [])
+    known = {shape["name"] for shape in shapes}
+    unknown = sorted(requested - known)
+    if unknown:
+        raise ValueError(f"Unknown shape name(s): {', '.join(unknown)}")
+
+    selected = [shape for shape in shapes if not requested or shape["name"] in requested]
+    if skip_experimental_tool_choice:
+        selected = [shape for shape in selected if not shape["experimental_tool_choice"]]
+    return selected
 
 
 def probe_shape(
@@ -164,6 +201,7 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     usable_shapes: list[str] = []
     missing_trace_shapes: list[str] = []
     failed_shapes: list[str] = []
+    recommended_shape = "none"
     for result in results:
         status_code = result.get("http_status")
         successful = isinstance(status_code, int) and 200 <= status_code < 300
@@ -172,6 +210,8 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         )
         if usable:
             usable_shapes.append(result["shape"])
+            if recommended_shape == "none" and not result.get("experimental_tool_choice", False):
+                recommended_shape = result["shape"]
         elif successful:
             missing_trace_shapes.append(result["shape"])
         else:
@@ -180,7 +220,7 @@ def summarize_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "usable_shapes": usable_shapes,
         "missing_trace_shapes": missing_trace_shapes,
         "failed_shapes": failed_shapes,
-        "recommended_shape": usable_shapes[0] if usable_shapes else "none",
+        "recommended_shape": recommended_shape,
     }
 
 
@@ -324,28 +364,92 @@ def _safe_netloc(parts: Any) -> str:
     return f"{hostname}:{parts.port}" if parts.port is not None else hostname
 
 
-def _required_environment() -> tuple[str, str, str]:
+def _required_environment(environ: dict[str, str] | None = None) -> tuple[str, str, str]:
+    source = os.environ if environ is None else environ
     names = ("GROK_SEARCH_BASE_URL", "GROK_SEARCH_API_KEY", "GROK_SEARCH_MODEL")
-    values = tuple(os.environ.get(name, "").strip() for name in names)
+    values = tuple(source.get(name, "").strip() for name in names)
     missing = [name for name, value in zip(names, values) if not value]
     if missing:
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
     return values
 
 
-def main() -> int:
-    argparse.ArgumentParser(description="Probe CPA Responses request-shape compatibility.").parse_args()
+def parse_shape_names(values: list[str] | None) -> list[str]:
+    names: list[str] = []
+    for value in values or []:
+        names.extend(name.strip() for name in value.split(",") if name.strip())
+    return names
+
+
+def emit_json(value: dict[str, Any]) -> None:
+    print(json.dumps(value, ensure_ascii=False), flush=True)
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Probe CPA Responses request-shape compatibility.")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-shape HTTP timeout in seconds.")
+    parser.add_argument(
+        "--shape",
+        action="append",
+        help="Shape name to run. Repeat the option or use comma-separated names.",
+    )
+    parser.add_argument(
+        "--skip-experimental-tool-choice",
+        action="store_true",
+        help="Skip shapes that set experimental tool_choice values.",
+    )
+    parser.add_argument(
+        "--list-shapes",
+        action="store_true",
+        help="List available shapes without reading environment variables or sending HTTP requests.",
+    )
+    return parser
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    environ: dict[str, str] | None = None,
+    client_factory: Callable[[], Any] = httpx.Client,
+    output: Callable[[dict[str, Any]], None] = emit_json,
+) -> int:
+    args = build_argument_parser().parse_args(argv)
+    shape_names = parse_shape_names(args.shape)
+    available_shapes = build_request_shapes("grok-probe-placeholder")
+
+    if args.list_shapes:
+        for shape in available_shapes:
+            output(
+                {
+                    "shape": shape["name"],
+                    "experimental_tool_choice": shape["experimental_tool_choice"],
+                }
+            )
+        return 0
+
     try:
-        base_url, api_key, model = _required_environment()
-        with httpx.Client() as client:
-            report = probe_shapes(base_url=base_url, api_key=api_key, model=model, http_client=client)
+        select_request_shapes(
+            available_shapes,
+            shape_names=shape_names,
+            skip_experimental_tool_choice=args.skip_experimental_tool_choice,
+        )
+        base_url, api_key, model = _required_environment(environ)
+        with client_factory() as client:
+            report = probe_shapes(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                http_client=client,
+                timeout=args.timeout,
+                shape_names=shape_names,
+                skip_experimental_tool_choice=args.skip_experimental_tool_choice,
+                event_sink=output,
+            )
     except ValueError as exc:
-        print(json.dumps({"error": redact_text(exc)}, ensure_ascii=False))
+        output({"error": redact_text(exc)})
         return 2
 
-    for result in report["results"]:
-        print(json.dumps(result, ensure_ascii=False))
-    print(json.dumps({"summary": report["summary"]}, ensure_ascii=False))
+    output({"summary": report["summary"]})
     return 0
 
 

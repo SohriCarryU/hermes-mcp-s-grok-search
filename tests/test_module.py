@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import httpx
 import pytest
 
 from hermes_mcps_grok_search import MODULE, register_module
@@ -11,9 +12,12 @@ from hermes_mcps_grok_search.tools import make_grok_search_handler
 from hermes_mcps_grok_search.validation import parse_config, normalize_endpoint
 from scripts.probe_cpa_responses_shapes import (
     build_request_shapes,
+    emit_json,
+    main as probe_main,
     normalize_responses_endpoint,
     probe_shapes,
     sanitize_url,
+    summarize_results,
 )
 
 
@@ -61,6 +65,12 @@ class ShapeFakeHttpClient:
         if isinstance(response, Exception):
             raise response
         return response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
 
 
 def test_module_metadata():
@@ -519,3 +529,193 @@ def test_probe_rejects_router_model_before_http():
         )
 
     assert fake_http.calls == []
+
+
+def test_probe_cli_list_shapes_needs_no_env_or_http():
+    output = []
+    client_created = False
+
+    def client_factory():
+        nonlocal client_created
+        client_created = True
+        raise AssertionError("HTTP client must not be created")
+
+    exit_code = probe_main(
+        ["--list-shapes"],
+        environ={},
+        client_factory=client_factory,
+        output=output.append,
+    )
+
+    assert exit_code == 0
+    assert client_created is False
+    assert len(output) == 11
+    assert sum(item["experimental_tool_choice"] for item in output) == 2
+    assert output[0]["shape"] == "baseline_string_input"
+
+
+def test_probe_cli_shape_options_run_only_selected_shapes():
+    fake_http = ShapeFakeHttpClient([FakeResponse(), FakeResponse(), FakeResponse()])
+    output = []
+
+    exit_code = probe_main(
+        [
+            "--shape",
+            "baseline_string_input,no_max_output_tokens",
+            "--shape",
+            "higher_output_tokens",
+        ],
+        environ=_probe_environment(),
+        client_factory=lambda: fake_http,
+        output=output.append,
+    )
+
+    assert exit_code == 0
+    assert len(fake_http.calls) == 3
+    assert [call["timeout"] for call in fake_http.calls] == [30.0, 30.0, 30.0]
+    assert [item["shape"] for item in output if item.get("event") == "start"] == [
+        "baseline_string_input",
+        "no_max_output_tokens",
+        "higher_output_tokens",
+    ]
+
+
+def test_probe_cli_skips_experimental_tool_choice_shapes():
+    fake_http = ShapeFakeHttpClient([FakeResponse() for _ in range(9)])
+    output = []
+
+    exit_code = probe_main(
+        ["--skip-experimental-tool-choice"],
+        environ=_probe_environment(),
+        client_factory=lambda: fake_http,
+        output=output.append,
+    )
+
+    assert exit_code == 0
+    assert len(fake_http.calls) == 9
+    starts = [item for item in output if item.get("event") == "start"]
+    assert len(starts) == 9
+    assert all(item["experimental_tool_choice"] is False for item in starts)
+
+
+def test_probe_cli_unknown_shape_fails_without_env_or_http():
+    output = []
+    client_created = False
+
+    def client_factory():
+        nonlocal client_created
+        client_created = True
+        raise AssertionError("HTTP client must not be created")
+
+    exit_code = probe_main(
+        ["--shape", "missing_shape"],
+        environ={},
+        client_factory=client_factory,
+        output=output.append,
+    )
+
+    assert exit_code != 0
+    assert client_created is False
+    assert len(output) == 1
+    assert "Unknown shape name" in output[0]["error"]
+
+
+def test_probe_cli_timeout_failure_continues_and_preserves_event_order():
+    sensitive_url = (
+        "https://example.invalid/source?"
+        + "tok"
+        + "en=dummy-url-token-456"
+        + "&q=pnpm&"
+        + "api_"
+        + "key=dummy-url-secret-789"
+    )
+    fake_http = ShapeFakeHttpClient(
+        [
+            httpx.ReadTimeout("Bearer dummy-api-key-123 timed out"),
+            FakeResponse(payload={"output_text": f"Official source: {sensitive_url}"}),
+        ]
+    )
+    output = []
+
+    exit_code = probe_main(
+        [
+            "--shape",
+            "baseline_string_input,no_max_output_tokens",
+            "--timeout",
+            "7.5",
+        ],
+        environ=_probe_environment(),
+        client_factory=lambda: fake_http,
+        output=output.append,
+    )
+
+    assert exit_code == 0
+    assert len(fake_http.calls) == 2
+    assert [call["timeout"] for call in fake_http.calls] == [7.5, 7.5]
+    assert output[0] == {
+        "event": "start",
+        "shape": "baseline_string_input",
+        "experimental_tool_choice": False,
+    }
+    assert output[1]["shape"] == "baseline_string_input"
+    assert output[1]["http_status"] is None
+    assert output[1]["error"]["message"] == "[redacted] timed out"
+    assert output[2] == {
+        "event": "start",
+        "shape": "no_max_output_tokens",
+        "experimental_tool_choice": False,
+    }
+    assert output[3]["shape"] == "no_max_output_tokens"
+    assert output[4]["summary"]["failed_shapes"] == ["baseline_string_input"]
+    serialized = str(output)
+    assert "dummy-api-key-123" not in serialized
+    assert "dummy-url-token-456" not in serialized
+    assert "dummy-url-secret-789" not in serialized
+    assert "q=pnpm" in serialized
+    assert "[redacted]" in serialized or "%5Bredacted%5D" in serialized
+
+
+def test_probe_summary_never_recommends_experimental_tool_choice():
+    summary = summarize_results(
+        [
+            {
+                "shape": "baseline_string_input",
+                "experimental_tool_choice": False,
+                "http_status": 200,
+                "trace_status": "missing",
+                "text_url_count": 0,
+            },
+            {
+                "shape": "experimental_tool_choice_required",
+                "experimental_tool_choice": True,
+                "http_status": 200,
+                "trace_status": "structured",
+                "text_url_count": 0,
+            },
+        ]
+    )
+
+    assert summary["usable_shapes"] == ["experimental_tool_choice_required"]
+    assert summary["recommended_shape"] == "none"
+
+
+def test_probe_emit_json_flushes(monkeypatch):
+    calls = []
+
+    def fake_print(value, **kwargs):
+        calls.append((value, kwargs))
+
+    monkeypatch.setattr("builtins.print", fake_print)
+
+    emit_json({"event": "start", "shape": "baseline_string_input"})
+
+    assert len(calls) == 1
+    assert calls[0][1]["flush"] is True
+
+
+def _probe_environment():
+    return {
+        "GROK_SEARCH_BASE_URL": "https://example.invalid/v1",
+        "GROK_SEARCH_API_KEY": "dummy-api-key-123",
+        "GROK_SEARCH_MODEL": "grok-test",
+    }
